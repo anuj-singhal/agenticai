@@ -290,7 +290,6 @@ class MCPAgent:
                         })
             else:
                 # No more tool calls, the task is complete
-                logger.info(f"No more tool calls, the task is complete")
                 final_response = message.content
                 results.append(final_response)
                 break
@@ -327,6 +326,52 @@ class MCPAgent:
         context += f"RECENT TASKS: {[t['task'] for t in self.memory.task_history[-3:]]}\n"
         context += f"LEARNED PATTERNS: {list(self.memory.learned_patterns.keys())[-3:]}\n"
         return context
+    
+    async def _execute_plan(self, plan: Dict[str, Any]) -> Tuple[Any, bool]:
+        """Execute the planned steps"""
+        results = []
+        tools_used = []
+        
+        try:
+            for step_info in plan['plan']:
+                step_num = step_info['step']
+                description = step_info['description']
+                tool_name = step_info.get('tool_name')
+                arguments = step_info.get('arguments', {})
+                
+                logger.info(f"Executing Step {step_num}: {description}")
+                
+                if tool_name:
+                    # Find which server has this tool
+                    server_name = self.tool_name_to_server.get(tool_name)
+                    if not server_name:
+                        # Try to find the tool in available tools
+                        found = False
+                        for server, tools in self.available_tools.items():
+                            if tool_name in tools:
+                                server_name = server
+                                found = True
+                                break
+                        
+                        if not found:
+                            raise ValueError(f"Tool {tool_name} not found in any server")
+                    
+                    # Execute the tool
+                    result = await self._use_tool(server_name, tool_name, arguments or {}, description)
+                    results.append(result)
+                    tools_used.append(f"{server_name}.{tool_name}")
+                    
+                    logger.info(f"Step {step_num} completed with result: {str(result)[:200]}")
+                else:
+                    # This is a planning or informational step
+                    results.append(f"Completed: {description}")
+                    logger.info(f"Step {step_num} completed: {description}")
+            
+            return results, True
+            
+        except Exception as e:
+            logger.error(f"Error executing plan: {e}")
+            return str(e), False
     
     async def _use_tool(self, server_name: str, tool_name: str, arguments: Dict[str, Any], task: str) -> Any:
         """Use a specific tool from an MCP server"""
@@ -411,6 +456,12 @@ class MCPAgent:
                 logger.info(f"Task planning completed with confidence: {plan.get('confidence', 0)}")
 
                 results, execution_success, tools_used = await self._execute_with_openai_tool_calling(task)
+            else:
+                # Use custom planning approach
+                plan = await self._plan_task_execution(task)
+                logger.info(f"Task planning completed with confidence: {plan.get('confidence', 0)}")
+                results, execution_success = await self._execute_plan(plan)
+                tools_used = [step.get('tool_name', '') for step in plan.get('plan', []) if step.get('tool_name')]
             
             # Evaluate results with LLM
             evaluation = await self._evaluate_results_with_llm(task, results, execution_success)
